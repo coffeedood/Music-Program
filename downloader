@@ -1,0 +1,133 @@
+import os
+import shutil
+import urllib.request
+import tkinter as tk
+from tkinter import filedialog
+from urllib.parse import unquote
+
+
+def download_song(url_or_path, download_folder):
+    """
+    Download a song from a URL or copy it from a local path into the specified folder.
+    """
+    try:
+        # Clean the path and decode any URL-encoded characters (e.g., %20 for space)
+        path = unquote(url_or_path.strip())
+
+        # If the path starts with file:\, replace it with file://
+        if path.lower().startswith("file:\\"):
+            path = path.replace("file:\\", "file:///")
+
+        # Handle 'file://' URLs
+        if path.lower().startswith("file:///"):
+            path = path[8:]  # Remove 'file:///' prefix
+            path = unquote(path)
+            path = path.replace("/", "\\")
+            path = os.path.normpath(path)
+
+        filename = os.path.basename(path)
+        target_path = os.path.join(download_folder, filename)
+
+        # Handle URL download or local file copy
+        if path.startswith("http://") or path.startswith("https://"):
+            print(f"Downloading from URL: {path}")
+            urllib.request.urlretrieve(path, target_path)
+            print(f"Downloaded: {filename}")
+        elif os.path.exists(path):
+            print(f"Copying local file: {path}")
+            shutil.copy(path, target_path)
+            print(f"Copied: {filename}")
+        else:
+            print(f"File not found or invalid path: {path}")
+
+    except Exception as e:
+        print(f"Error handling {url_or_path}: {e}")
+
+
+def parse_m3u_file(file_path):
+    """
+    Parse an M3U file and return a list of resolved file paths or URLs.
+    """
+    lines = []
+    for encoding in ['utf-8', 'latin-1']:
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                lines = file.readlines()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        print(f"Error: Could not decode file {file_path}")
+        return []
+
+    base_dir = os.path.dirname(file_path)
+    song_paths = []
+
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            decoded_line = unquote(line)
+
+            # If path is not absolute or URL, make it absolute
+            if not decoded_line.startswith(("http://", "https://", "file://")) and not os.path.isabs(decoded_line):
+                decoded_line = os.path.abspath(os.path.join(base_dir, decoded_line))
+
+            decoded_line = os.path.normpath(decoded_line)
+            song_paths.append(decoded_line)
+
+    return song_paths
+
+
+def download_playlist_from_folder(source_folder, download_folder):
+    """
+    Process all M3U files in the source folder and download/copy songs to the download folder.
+    Each playlist gets its own subfolder named after the playlist file.
+    """
+    if not os.path.exists(download_folder):
+        os.makedirs(download_folder)
+
+    for m3u_file in os.listdir(source_folder):
+        m3u_path = os.path.join(source_folder, m3u_file)
+
+        if m3u_file.endswith(".m3u"):
+            playlist_name = os.path.splitext(m3u_file)[0]
+            playlist_folder = os.path.join(download_folder, playlist_name)
+
+            if not os.path.exists(playlist_folder):
+                os.makedirs(playlist_folder)
+
+            print(f"\nProcessing playlist: {m3u_file}")
+            print(f"Saving files to: {playlist_folder}")
+
+            song_paths = parse_m3u_file(m3u_path)
+
+            for path in song_paths:
+                print(f"Resolved path: {path}")
+                download_song(path, playlist_folder)
+        else:
+            print(f"Skipping non-M3U file: {m3u_file}")
+
+
+def select_folder(title="Select a Folder"):
+    """
+    Open a folder dialog for the user to select a folder.
+    """
+    root = tk.Tk()
+    root.withdraw()
+    folder = filedialog.askdirectory(title=title)
+    return folder
+
+
+if __name__ == "__main__":
+    # Ask user to select the folder containing M3U playlists
+    source_folder = select_folder("Select Folder Containing M3U Playlists")
+
+    # Ask user to select the folder to save downloaded/copied songs
+    download_folder = select_folder("Select Folder to Save Songs")
+
+    if source_folder and download_folder:
+        print(f"\nSource folder: {source_folder}")
+        print(f"Download folder: {download_folder}")
+        download_playlist_from_folder(source_folder, download_folder)
+    else:
+        print("Folder selection was canceled.")
