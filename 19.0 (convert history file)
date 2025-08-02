@@ -1,0 +1,180 @@
+"""
+Convert a playlist of Windows-style file URIs (e.g.,
+    file:///C:\\Users\\coffe\\Downloads\\playlists\\Old Paint Freakwater.m3u)
+into lines of the form:
+    # Playlist: Old Paint Freakwater
+
+This script launches a minimal Tkinter UI flow:
+1. Ask user to pick a source .m3u file that contains file:/// paths.
+2. Ask user to choose an output folder.
+3. Write a new .m3u file ("<source_name>_converted.m3u") containing # Playlist: lines.
+
+The conversion preserves the *display name* taken from the basename of each path
+(without the .m3u extension). Percent-encoding in the path portion is automatically
+unquoted (so "%20" -> space) unless disabled.
+
+You can also import and call the functions programmatically from another script.
+
+Tested on Windows-style paths but should behave sensibly elsewhere.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import urllib.parse
+
+# ---------------------------------------------------------------------------
+# Core parsing / conversion functions
+# ---------------------------------------------------------------------------
+
+def parse_m3u_paths(text: str, *, decode_percent: bool = True) -> list[str]:
+    """Extract *display names* from an M3U file that lists file:///... URIs.
+
+    Rules:
+    - Ignore blank lines.
+    - Ignore lines beginning with '#'. (standard M3U comments / directives)
+    - Strip a leading 'file:///' (case-insensitive) if present.
+    - Optionally percent-decode the remaining path.
+    - Take the basename (last path component).
+    - Drop a trailing '.m3u' (case-insensitive).
+    - Keep resulting text as the playlist display name.
+    """
+    names: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith('#'):  # comment / directive
+            continue
+
+        # Strip file:/// prefix
+        if line.lower().startswith('file:///'):
+            path_part = line[8:]  # keep the remaining characters exactly as-is
+        else:
+            path_part = line
+
+        # Percent decode, if desired
+        if decode_percent:
+            path_part = urllib.parse.unquote(path_part)
+
+        # Get just the filename
+        filename = os.path.basename(path_part)
+
+        # Remove extension (.m3u)
+        if filename.lower().endswith('.m3u'):
+            filename = filename[:-4]
+
+        filename = filename.strip()
+        if filename:
+            names.append(filename)
+    return names
+
+
+def build_playlist_lines(names: list[str], *, prefix: str = '# Playlist: ') -> str:
+    """Build the # Playlist: lines text block from a list of names."""
+    return "\n".join(f"{prefix}{n}" for n in names) + ("\n" if names else "")
+
+
+def convert_file_uris_m3u_to_playlist_lines(input_path: os.PathLike[str] | str,
+                                            *,
+                                            decode_percent: bool = True) -> tuple[list[str], str]:
+    """Read an input M3U file and return (names_list, playlist_block_text)."""
+    text = pathlib.Path(input_path).read_text(encoding='utf-8', errors='replace')
+    names = parse_m3u_paths(text, decode_percent=decode_percent)
+    block = build_playlist_lines(names)
+    return names, block
+
+
+# ---------------------------------------------------------------------------
+# Tkinter workflow
+# ---------------------------------------------------------------------------
+
+def run_gui():
+    """Interactive GUI flow: pick source .m3u, pick output folder, write converted file."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the root window; we only want dialogs.
+
+    # 1. Select source M3U file
+    in_path = filedialog.askopenfilename(
+        title="Select source M3U file (with file:/// paths)",
+        filetypes=[("M3U playlists", "*.m3u"), ("All files", "*.*")],
+    )
+    if not in_path:
+        messagebox.showinfo("Cancelled", "No source file selected.")
+        return
+
+    # 2. Parse the file
+    names, block = convert_file_uris_m3u_to_playlist_lines(in_path)
+    if not names:
+        messagebox.showwarning("No entries", "No valid file URIs found in the selected file.")
+        return
+
+    # 3. Choose output directory
+    out_dir = filedialog.askdirectory(title="Select folder to save converted M3U")
+    if not out_dir:
+        messagebox.showinfo("Cancelled", "No output folder selected.")
+        return
+
+    # 4. Determine output filename
+    in_stem = pathlib.Path(in_path).stem
+    out_name = f"{in_stem}_converted.m3u"
+    out_path = pathlib.Path(out_dir) / out_name
+
+    # 5. Write the converted playlist
+    try:
+        out_path.write_text(block, encoding='utf-8')
+    except OSError as e:
+        messagebox.showerror("Write Error", f"Couldn't write file:\n{out_path}\n\n{e}")
+        return
+
+    # 6. Done
+    messagebox.showinfo("Conversion complete", f"Converted playlist written to:\n{out_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI support
+# ---------------------------------------------------------------------------
+
+def _cli(argv: list[str] | None = None) -> int:
+    """Command-line interface.
+
+    Usage:
+        python m3u_uri_to_playlist_converter.py            # GUI flow
+        python m3u_uri_to_playlist_converter.py in.m3u     # Convert to stdout
+        python m3u_uri_to_playlist_converter.py in.m3u out.m3u  # Convert, write to out.m3u
+    """
+    import sys
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        # No args: launch GUI
+        run_gui()
+        return 0
+
+    in_path = argv[0]
+    if not pathlib.Path(in_path).is_file():
+        print(f"Error: input file not found: {in_path}", file=sys.stderr)
+        return 1
+
+    names, block = convert_file_uris_m3u_to_playlist_lines(in_path)
+    if len(argv) == 1:
+        # Write to stdout
+        sys.stdout.write(block)
+        return 0
+
+    out_path = argv[1]
+    try:
+        pathlib.Path(out_path).write_text(block, encoding='utf-8')
+    except OSError as e:
+        print(f"Error writing {out_path}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_cli())
