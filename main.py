@@ -1,19 +1,193 @@
 import os
+import sys
+import json
 import urllib.parse
 import subprocess
 import string
 import random
+import hashlib
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from fuzzywuzzy import process
 
-MAX_FILENAME_LENGTH = 215  
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    from mutagen import File as MutagenFile
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+
+THUMBNAIL_FOLDER = os.path.join("playlists", "thumbnails")
+os.makedirs(THUMBNAIL_FOLDER, exist_ok=True)
+THUMBNAIL_SIZE = (200, 150)
+
+MAX_FILENAME_LENGTH = 215
 VALID_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
 
-VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+if sys.platform == "win32":
+    VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+else:
+    VLC_PATH = "vlc"
+
+def open_file_with_default_app(filepath):
+    if sys.platform == "win32":
+        os.startfile(filepath)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", filepath])
+    else:
+        subprocess.run(["xdg-open", filepath])
 
 PLAYLIST_FOLDER = "playlists"
 os.makedirs(PLAYLIST_FOLDER, exist_ok=True)
+
+CONFIG_FILE = os.path.join(PLAYLIST_FOLDER, "config.json")
+
+def load_config():
+    default_config = {
+        "auto_scan_enabled": False,
+        "scan_folders": {
+            "mkv": [],
+            "mp4": [],
+            "pdf": []
+        }
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return default_config
+
+def save_config(config):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+def get_thumbnail_path(media_path):
+    path_hash = hashlib.md5(media_path.encode()).hexdigest()
+    return os.path.join(THUMBNAIL_FOLDER, f"{path_hash}.png")
+
+def extract_video_thumbnail(video_path):
+    if not os.path.exists(video_path):
+        return None
+
+    thumb_path = get_thumbnail_path(video_path)
+    if os.path.exists(thumb_path):
+        return thumb_path
+
+    try:
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-ss", "00:00:30",
+            "-vframes", "1",
+            "-vf", f"scale={THUMBNAIL_SIZE[0]}:{THUMBNAIL_SIZE[1]}:force_original_aspect_ratio=decrease",
+            "-y", thumb_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except:
+        pass
+
+    try:
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-ss", "00:00:05",
+            "-vframes", "1",
+            "-vf", f"scale={THUMBNAIL_SIZE[0]}:{THUMBNAIL_SIZE[1]}:force_original_aspect_ratio=decrease",
+            "-y", thumb_path
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except:
+        pass
+
+    return None
+
+def extract_audio_thumbnail(audio_path):
+    if not MUTAGEN_AVAILABLE or not PIL_AVAILABLE:
+        return None
+
+    if not os.path.exists(audio_path):
+        return None
+
+    thumb_path = get_thumbnail_path(audio_path)
+    if os.path.exists(thumb_path):
+        return thumb_path
+
+    try:
+        audio = MutagenFile(audio_path)
+        if audio is None:
+            return None
+
+        artwork = None
+        if hasattr(audio, 'pictures') and audio.pictures:
+            artwork = audio.pictures[0].data
+        elif 'APIC:' in audio:
+            artwork = audio['APIC:'].data
+        elif hasattr(audio, 'tags'):
+            for key in audio.tags.keys():
+                if key.startswith('APIC'):
+                    artwork = audio.tags[key].data
+                    break
+            if not artwork and 'covr' in audio.tags:
+                artwork = bytes(audio.tags['covr'][0])
+
+        if artwork:
+            import io
+            img = Image.open(io.BytesIO(artwork))
+            img.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+            img.save(thumb_path, "PNG")
+            return thumb_path
+    except:
+        pass
+
+    return None
+
+def extract_pdf_thumbnail(pdf_path):
+    if not PIL_AVAILABLE:
+        return None
+
+    thumb_path = get_thumbnail_path(pdf_path)
+    if os.path.exists(thumb_path):
+        return thumb_path
+
+    try:
+        cmd = [
+            "pdftoppm", "-png", "-f", "1", "-l", "1",
+            "-scale-to", str(THUMBNAIL_SIZE[0]),
+            pdf_path, thumb_path.replace(".png", "")
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        generated = thumb_path.replace(".png", "-1.png")
+        if os.path.exists(generated):
+            os.rename(generated, thumb_path)
+            return thumb_path
+    except:
+        pass
+
+    return None
+
+def get_thumbnail(media_path, media_type):
+    if not PIL_AVAILABLE:
+        return None
+
+    ext = os.path.splitext(media_path)[1].lower()
+
+    if media_type in ("MKV", "MP4", "AVI", "Video") or ext in (".mkv", ".mp4", ".avi", ".webm", ".mov"):
+        return extract_video_thumbnail(media_path)
+    elif media_type == "PDF" or ext == ".pdf":
+        return extract_pdf_thumbnail(media_path)
+    elif ext in (".mp3", ".flac", ".ogg", ".m4a", ".wma", ".aac"):
+        return extract_audio_thumbnail(media_path)
+
+    return None
 
 HISTORY_AUDIO = os.path.join(PLAYLIST_FOLDER, "history.m3u")
 HISTORY_VIDEO = os.path.join(PLAYLIST_FOLDER, "history2.m3u")
@@ -167,7 +341,7 @@ def search_and_open(query):
                 messagebox.showwarning("Missing File", f"PDF file no longer exists:\n{pdf_path}")
                 return
 
-            os.startfile(pdf_path)
+            open_file_with_default_app(pdf_path)
             log_pdf_opened(pdf_path)  # Log that this PDF has been opened
             messagebox.showinfo("Opening PDF", f"Opening PDF: {best_match}")
         except Exception as e:
@@ -175,6 +349,7 @@ def search_and_open(query):
 
 def play_random_from_history2(history_file, description):
     import os
+    import sys
     import urllib.parse
     import subprocess
     import random
@@ -185,11 +360,14 @@ def play_random_from_history2(history_file, description):
     from fuzzywuzzy import process
 
     # Maximum length for Windows filenames
-    MAX_FILENAME_LENGTH = 215  
+    MAX_FILENAME_LENGTH = 215
     VALID_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
 
     # Path to VLC executable
-    VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+    if sys.platform == "win32":
+        VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+    else:
+        VLC_PATH = "vlc"
 
     # Folder to store generated .m3u playlists
     PLAYLIST_FOLDER = "playlists"
@@ -775,6 +953,7 @@ def play_random_from_history4(history_file, description):
 
 def play_random_from_history3(history_file, description):
     import os
+    import sys
     import urllib.parse
     import subprocess
     import random
@@ -786,7 +965,10 @@ def play_random_from_history3(history_file, description):
     # Constants
     MAX_FILENAME_LENGTH = 215
     VALID_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
-    VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+    if sys.platform == "win32":
+        VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+    else:
+        VLC_PATH = "vlc"
     PLAYLIST_FOLDER = "playlists"
     os.makedirs(PLAYLIST_FOLDER, exist_ok=True)
 
@@ -971,6 +1153,7 @@ def play_random_from_history3(history_file, description):
 
 def play_random_from_history(history_file, description):
     import os
+    import sys
     import urllib.parse
     import subprocess
     import string
@@ -979,10 +1162,13 @@ def play_random_from_history(history_file, description):
     from tkinter import filedialog, messagebox
     from fuzzywuzzy import process
 
-    MAX_FILENAME_LENGTH = 215  
+    MAX_FILENAME_LENGTH = 215
     VALID_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
 
-    VLC_PATH = r"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"
+    if sys.platform == "win32":
+        VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+    else:
+        VLC_PATH = "vlc"
 
     PLAYLIST_FOLDER = "playlists"
     os.makedirs(PLAYLIST_FOLDER, exist_ok=True)
@@ -1115,7 +1301,12 @@ def play_random_from_history(history_file, description):
 
         try:
             if description.startswith("pdf"):
-                os.startfile(selected_path)
+                if sys.platform == "win32":
+                    os.startfile(selected_path)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", selected_path])
+                else:
+                    subprocess.run(["xdg-open", selected_path])
             else:
                 subprocess.run([VLC_PATH, selected_path])
             messagebox.showinfo("Playing Random", f"Playing random {description}:\n{os.path.basename(selected_path)}")
@@ -1134,7 +1325,12 @@ def play_random_from_history(history_file, description):
                     if os.path.exists(path):
                         try:
                             if history_file == PDF_HISTORY_FILE:
-                                os.startfile(path)
+                                if sys.platform == "win32":
+                                    os.startfile(path)
+                                elif sys.platform == "darwin":
+                                    subprocess.run(["open", path])
+                                else:
+                                    subprocess.run(["xdg-open", path])
                             else:
                                 subprocess.run([VLC_PATH, path])
                             log_media_opened(path, history_file)
@@ -1236,6 +1432,7 @@ def play_random_from_history(history_file, description):
 
         def scan_pdf_folder(self):
             import os
+            import sys
             import urllib.parse
             import subprocess
             import string
@@ -1244,10 +1441,13 @@ def play_random_from_history(history_file, description):
             from tkinter import filedialog, messagebox
             from fuzzywuzzy import process
 
-            MAX_FILENAME_LENGTH = 215  
+            MAX_FILENAME_LENGTH = 215
             VALID_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
 
-            VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+            if sys.platform == "win32":
+                VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+            else:
+                VLC_PATH = "vlc"
 
             PLAYLIST_FOLDER = "playlists"
             os.makedirs(PLAYLIST_FOLDER, exist_ok=True)
@@ -1404,7 +1604,12 @@ def play_random_from_history(history_file, description):
                             messagebox.showwarning("Missing File", f"PDF file no longer exists:\n{pdf_path}")
                             return
 
-                        os.startfile(pdf_path)
+                        if sys.platform == "win32":
+                            os.startfile(pdf_path)
+                        elif sys.platform == "darwin":
+                            subprocess.run(["open", pdf_path])
+                        else:
+                            subprocess.run(["xdg-open", pdf_path])
                         log_pdf_opened(pdf_path)  # Log that this PDF has been opened
                         messagebox.showinfo("Opening PDF", f"Opening PDF: {best_match}")
                     except Exception as e:
@@ -1434,7 +1639,12 @@ def play_random_from_history(history_file, description):
 
                 try:
                     if description.startswith("pdf"):
-                        os.startfile(selected_path)  # For PDFs, open with default app
+                        if sys.platform == "win32":
+                            os.startfile(selected_path)
+                        elif sys.platform == "darwin":
+                            subprocess.run(["open", selected_path])
+                        else:
+                            subprocess.run(["xdg-open", selected_path])
                     else:
                         subprocess.run([VLC_PATH, selected_path])
                     messagebox.showinfo("Playing Random", f"Playing random {description}:\n{os.path.basename(selected_path)}")
@@ -1494,7 +1704,12 @@ def play_random_from_history(history_file, description):
                     return
 
                 try:
-                    os.startfile(selected_pdf)
+                    if sys.platform == "win32":
+                        os.startfile(selected_pdf)
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", selected_pdf])
+                    else:
+                        subprocess.run(["xdg-open", selected_pdf])
                     messagebox.showinfo("Opening Random PDF", f"Opening PDF: {os.path.basename(selected_pdf)}")
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to open PDF:\n{e}")
@@ -1651,7 +1866,7 @@ def play_random_pdf_opened():
         return
 
     try:
-        os.startfile(selected_pdf)
+        open_file_with_default_app(selected_pdf)
         messagebox.showinfo("Opening Random PDF", f"Opening PDF: {os.path.basename(selected_pdf)}")
     except Exception as e:
         messagebox.showerror("Error", f"Failed to open PDF:\n{e}")
@@ -1660,40 +1875,215 @@ class MKVPlayerApp:
     def __init__(self, root):
         self.root = root
         self.generator = MKVPlaylistGenerator()
+        self.config = load_config()
+        self.current_thumbnail = None
 
-        # Video scan and playlist
-        tk.Button(root, text="Scan Folder for MKVs", command=self.scan_folder).pack(pady=5)
+        self.create_menu()
 
-        # New button: scan for MP4s and create playlists
-        tk.Button(root, text="Scan Folder for MP4s", command=self.scan_mp4_folder).pack(pady=5)
+        # Search frame
+        search_frame = tk.Frame(root)
+        search_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # Search and play by name (audio/video/pdf)
-        self.entry = tk.Entry(root, width=40)
-        self.entry.pack(pady=5)
+        self.entry = tk.Entry(search_frame, width=30)
+        self.entry.pack(side=tk.LEFT, padx=(0, 5))
         self.entry.bind("<Return>", self.search_event)
-        tk.Button(root, text="Search and Play (Audio/Video/PDF)", command=self.search).pack(pady=5)
+        self.entry.bind("<KeyRelease>", self.filter_library)
+        tk.Button(search_frame, text="Search", command=self.search).pack(side=tk.LEFT, padx=5)
+        tk.Button(search_frame, text="Play", command=self.play_selected).pack(side=tk.LEFT, padx=5)
 
-        # Play random from audio history (history.m3u)
-        tk.Button(root, text="VIDEOS", command=lambda: play_random_from_history(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        # Main content area with grid and preview panel
+        content_frame = tk.Frame(root)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        tk.Button(root, text="MUSIC SCAN", command=lambda: play_random_from_history2(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        # Media library grid (left side)
+        grid_frame = tk.Frame(content_frame)
+        grid_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        tk.Button(root, text="MUSIC PLAYER", command=lambda: play_random_from_history3(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        columns = ("name", "type", "path")
+        self.tree = ttk.Treeview(grid_frame, columns=columns, show="headings", selectmode="browse")
+        self.tree.heading("name", text="Name", command=lambda: self.sort_column("name"))
+        self.tree.heading("type", text="Type", command=lambda: self.sort_column("type"))
+        self.tree.heading("path", text="Path", command=lambda: self.sort_column("path"))
+        self.tree.column("name", width=250)
+        self.tree.column("type", width=60)
+        self.tree.column("path", width=250)
 
-        tk.Button(root, text="MUSIC history converter", command=lambda: play_random_from_history5(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        scrollbar_y = ttk.Scrollbar(grid_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        scrollbar_x = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
 
-        tk.Button(root, text="MUSIC history to playlist converter", command=lambda: play_random_from_history6(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+        grid_frame.grid_rowconfigure(0, weight=1)
+        grid_frame.grid_columnconfigure(0, weight=1)
 
-        tk.Button(root, text="MUSIC downloader", command=lambda: play_random_from_history4(HISTORY_AUDIO, "audio history")).pack(pady=5)
+        self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_selection_change)
 
-        # Play random from video history (history2.m3u)
-        tk.Button(root, text="🎬 Play Random Video from History", command=lambda: play_random_from_history(HISTORY_VIDEO, "video history")).pack(pady=5)
+        # Preview panel (right side)
+        preview_frame = tk.Frame(content_frame, width=220, relief=tk.GROOVE, borderwidth=1)
+        preview_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        preview_frame.pack_propagate(False)
 
-        # PDF scan button (just scans & logs PDFs)
-        tk.Button(root, text="Scan Folder for PDFs", command=self.scan_pdfs).pack(pady=5)
+        tk.Label(preview_frame, text="Preview", font=("Arial", 10, "bold")).pack(pady=5)
 
-        # New button: open a random PDF from opened PDF history
-        tk.Button(root, text="📄 Open Random PDF from Opened History", command=play_random_pdf_opened).pack(pady=5)
+        self.thumbnail_label = tk.Label(preview_frame, text="No preview", width=25, height=10, relief=tk.SUNKEN, bg="#2a2a2a", fg="#888888")
+        self.thumbnail_label.pack(padx=10, pady=5)
+
+        self.preview_name = tk.Label(preview_frame, text="", wraplength=200, justify=tk.CENTER)
+        self.preview_name.pack(pady=5)
+
+        self.preview_type = tk.Label(preview_frame, text="", fg="#666666")
+        self.preview_type.pack()
+
+        self.preview_status = tk.Label(preview_frame, text="", fg="#888888", font=("Arial", 8))
+        self.preview_status.pack(pady=5)
+
+        tk.Button(preview_frame, text="Play Selected", command=self.play_selected).pack(pady=10)
+
+        # Status bar
+        self.status_var = tk.StringVar(value="0 items")
+        status_bar = tk.Label(root, textvariable=self.status_var, anchor="w", relief=tk.SUNKEN)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Button frame
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Button(btn_frame, text="VIDEOS", command=lambda: play_random_from_history(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame, text="MUSIC SCAN", command=lambda: play_random_from_history2(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame, text="MUSIC PLAYER", command=lambda: play_random_from_history3(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+
+        btn_frame2 = tk.Frame(root)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Button(btn_frame2, text="History Converter", command=lambda: play_random_from_history5(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame2, text="Playlist Converter", command=lambda: play_random_from_history6(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame2, text="Downloader", command=lambda: play_random_from_history4(HISTORY_AUDIO, "audio history")).pack(side=tk.LEFT, padx=2)
+
+        btn_frame3 = tk.Frame(root)
+        btn_frame3.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Button(btn_frame3, text="Random Video", command=lambda: play_random_from_history(HISTORY_VIDEO, "video history")).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame3, text="Random PDF", command=play_random_pdf_opened).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame3, text="Refresh Library", command=self.refresh_library).pack(side=tk.LEFT, padx=2)
+
+        self.all_media_items = []
+        self.sort_reverse = False
+        self.sort_col = "name"
+
+        self.run_auto_scan()
+        self.refresh_library()
+
+    def create_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        scan_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Scan", menu=scan_menu)
+
+        scan_menu.add_command(label="Scan Folder for MKVs...", command=self.scan_folder)
+        scan_menu.add_command(label="Scan Folder for MP4s...", command=self.scan_mp4_folder)
+        scan_menu.add_command(label="Scan Folder for PDFs...", command=self.scan_pdfs)
+        scan_menu.add_separator()
+        scan_menu.add_command(label="Configure Auto-Scan Folders...", command=self.configure_auto_scan)
+        self.auto_scan_var = tk.BooleanVar(value=self.config.get("auto_scan_enabled", False))
+        scan_menu.add_checkbutton(label="Auto-Scan on Startup", variable=self.auto_scan_var, command=self.toggle_auto_scan)
+        scan_menu.add_separator()
+        scan_menu.add_command(label="Run Auto-Scan Now", command=lambda: self.run_auto_scan(show_message=True))
+
+    def toggle_auto_scan(self):
+        self.config["auto_scan_enabled"] = self.auto_scan_var.get()
+        save_config(self.config)
+
+    def configure_auto_scan(self):
+        config_window = tk.Toplevel(self.root)
+        config_window.title("Configure Auto-Scan Folders")
+        config_window.geometry("500x400")
+
+        tk.Label(config_window, text="MKV Folders:").pack(anchor="w", padx=10, pady=(10, 0))
+        mkv_listbox = tk.Listbox(config_window, height=4, width=60)
+        mkv_listbox.pack(padx=10, pady=5)
+        for folder in self.config["scan_folders"].get("mkv", []):
+            mkv_listbox.insert(tk.END, folder)
+
+        mkv_btn_frame = tk.Frame(config_window)
+        mkv_btn_frame.pack()
+        tk.Button(mkv_btn_frame, text="Add", command=lambda: self.add_folder(mkv_listbox, "mkv")).pack(side=tk.LEFT, padx=5)
+        tk.Button(mkv_btn_frame, text="Remove", command=lambda: self.remove_folder(mkv_listbox, "mkv")).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(config_window, text="MP4 Folders:").pack(anchor="w", padx=10, pady=(10, 0))
+        mp4_listbox = tk.Listbox(config_window, height=4, width=60)
+        mp4_listbox.pack(padx=10, pady=5)
+        for folder in self.config["scan_folders"].get("mp4", []):
+            mp4_listbox.insert(tk.END, folder)
+
+        mp4_btn_frame = tk.Frame(config_window)
+        mp4_btn_frame.pack()
+        tk.Button(mp4_btn_frame, text="Add", command=lambda: self.add_folder(mp4_listbox, "mp4")).pack(side=tk.LEFT, padx=5)
+        tk.Button(mp4_btn_frame, text="Remove", command=lambda: self.remove_folder(mp4_listbox, "mp4")).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(config_window, text="PDF Folders:").pack(anchor="w", padx=10, pady=(10, 0))
+        pdf_listbox = tk.Listbox(config_window, height=4, width=60)
+        pdf_listbox.pack(padx=10, pady=5)
+        for folder in self.config["scan_folders"].get("pdf", []):
+            pdf_listbox.insert(tk.END, folder)
+
+        pdf_btn_frame = tk.Frame(config_window)
+        pdf_btn_frame.pack()
+        tk.Button(pdf_btn_frame, text="Add", command=lambda: self.add_folder(pdf_listbox, "pdf")).pack(side=tk.LEFT, padx=5)
+        tk.Button(pdf_btn_frame, text="Remove", command=lambda: self.remove_folder(pdf_listbox, "pdf")).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(config_window, text="Close", command=config_window.destroy).pack(pady=20)
+
+    def add_folder(self, listbox, folder_type):
+        folder = filedialog.askdirectory(title=f"Select folder for {folder_type.upper()} scanning")
+        if folder:
+            if folder not in self.config["scan_folders"][folder_type]:
+                self.config["scan_folders"][folder_type].append(folder)
+                listbox.insert(tk.END, folder)
+                save_config(self.config)
+
+    def remove_folder(self, listbox, folder_type):
+        selection = listbox.curselection()
+        if selection:
+            index = selection[0]
+            folder = listbox.get(index)
+            listbox.delete(index)
+            if folder in self.config["scan_folders"][folder_type]:
+                self.config["scan_folders"][folder_type].remove(folder)
+                save_config(self.config)
+
+    def run_auto_scan(self, show_message=False):
+        if not self.config.get("auto_scan_enabled", False) and not show_message:
+            return
+
+        scan_folders = self.config.get("scan_folders", {})
+        scanned_any = False
+
+        for folder in scan_folders.get("mkv", []):
+            if os.path.isdir(folder):
+                self.generator.set_directories(folder)
+                if self.generator.create_mkv_playlists():
+                    scan_and_log_files(folder, (".mkv", ".mp4", ".avi"), HISTORY_VIDEO)
+                    scanned_any = True
+
+        for folder in scan_folders.get("mp4", []):
+            if os.path.isdir(folder):
+                if create_mp4_playlists(folder, PLAYLIST_FOLDER):
+                    scanned_any = True
+
+        for folder in scan_folders.get("pdf", []):
+            if os.path.isdir(folder):
+                if scan_and_log_files(folder, (".pdf",), PDF_HISTORY_FILE):
+                    scanned_any = True
+
+        if show_message:
+            if scanned_any:
+                messagebox.showinfo("Auto-Scan Complete", "All configured folders have been scanned.")
+            else:
+                messagebox.showinfo("Auto-Scan", "No folders configured or no new files found.")
 
     def scan_folder(self):
         folder = filedialog.askdirectory(title="Select folder to scan for MKVs")
@@ -1735,11 +2125,173 @@ class MKVPlayerApp:
             messagebox.showwarning("Empty Search", "Please enter a search term.")
             return
         search_and_open(query)
-        self.entry.delete(0, tk.END)  # Clear the search bar after search
+        self.entry.delete(0, tk.END)
+
+    def refresh_library(self):
+        self.all_media_items = []
+
+        for f in os.listdir(PLAYLIST_FOLDER):
+            if f.endswith(".m3u") and f not in ("history.m3u", "history2.m3u"):
+                playlist_path = os.path.join(PLAYLIST_FOLDER, f)
+                name = os.path.splitext(f)[0]
+                media_path = ""
+                media_type = "Video"
+
+                try:
+                    with open(playlist_path, "r", encoding="utf-8") as pf:
+                        for line in pf:
+                            line = line.strip()
+                            if line.startswith("file:///"):
+                                media_path = urllib.parse.unquote(line[8:])
+                                ext = os.path.splitext(media_path)[1].lower()
+                                if ext == ".mkv":
+                                    media_type = "MKV"
+                                elif ext == ".mp4":
+                                    media_type = "MP4"
+                                elif ext == ".avi":
+                                    media_type = "AVI"
+                                break
+                            elif line and not line.startswith("#"):
+                                media_path = line
+                                break
+                except:
+                    pass
+
+                self.all_media_items.append({
+                    "name": name,
+                    "type": media_type,
+                    "path": media_path,
+                    "playlist": playlist_path
+                })
+
+        if os.path.exists(PDF_HISTORY_FILE):
+            try:
+                with open(PDF_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        pdf_path = line.strip()
+                        if pdf_path and os.path.exists(pdf_path):
+                            self.all_media_items.append({
+                                "name": os.path.splitext(os.path.basename(pdf_path))[0],
+                                "type": "PDF",
+                                "path": pdf_path,
+                                "playlist": None
+                            })
+            except:
+                pass
+
+        self.populate_tree(self.all_media_items)
+
+    def populate_tree(self, items):
+        self.tree.delete(*self.tree.get_children())
+        for item in items:
+            self.tree.insert("", tk.END, values=(item["name"], item["type"], item["path"]))
+        self.status_var.set(f"{len(items)} items")
+
+    def filter_library(self, event=None):
+        query = self.entry.get().strip().lower()
+        if not query:
+            self.populate_tree(self.all_media_items)
+        else:
+            filtered = [item for item in self.all_media_items if query in item["name"].lower()]
+            self.populate_tree(filtered)
+
+    def sort_column(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+
+        self.all_media_items.sort(key=lambda x: x[col].lower(), reverse=self.sort_reverse)
+        self.filter_library()
+
+    def play_selected(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select an item to play.")
+            return
+
+        item = self.tree.item(selection[0])
+        values = item["values"]
+        name, media_type, path = values[0], values[1], values[2]
+
+        if media_type == "PDF":
+            if os.path.exists(path):
+                open_file_with_default_app(path)
+            else:
+                messagebox.showwarning("File Not Found", f"PDF file not found:\n{path}")
+        else:
+            for media_item in self.all_media_items:
+                if media_item["name"] == name and media_item["playlist"]:
+                    try:
+                        subprocess.run([VLC_PATH, media_item["playlist"]])
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to play:\n{e}")
+                    return
+            if os.path.exists(path):
+                try:
+                    subprocess.run([VLC_PATH, path])
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to play:\n{e}")
+
+    def on_double_click(self, event):
+        self.play_selected()
+
+    def on_selection_change(self, event=None):
+        selection = self.tree.selection()
+        if not selection:
+            self.clear_preview()
+            return
+
+        item = self.tree.item(selection[0])
+        values = item["values"]
+        name, media_type, path = values[0], values[1], values[2]
+
+        self.preview_name.config(text=name)
+        self.preview_type.config(text=media_type)
+
+        if not PIL_AVAILABLE:
+            self.preview_status.config(text="Install Pillow for thumbnails")
+            self.thumbnail_label.config(image="", text="No preview\n(Pillow not installed)")
+            return
+
+        self.preview_status.config(text="Loading thumbnail...")
+        self.root.update_idletasks()
+
+        self.root.after(10, lambda: self.load_thumbnail(path, media_type))
+
+    def load_thumbnail(self, path, media_type):
+        thumb_path = get_thumbnail(path, media_type)
+
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                img = Image.open(thumb_path)
+                img.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+                self.current_thumbnail = ImageTk.PhotoImage(img)
+                self.thumbnail_label.config(image=self.current_thumbnail, text="")
+                self.preview_status.config(text="")
+            except Exception as e:
+                self.thumbnail_label.config(image="", text="Error loading\nthumbnail")
+                self.preview_status.config(text=str(e)[:30])
+        else:
+            self.thumbnail_label.config(image="", text="No thumbnail\navailable")
+            if media_type in ("MKV", "MP4", "AVI", "Video"):
+                self.preview_status.config(text="ffmpeg required")
+            elif media_type == "PDF":
+                self.preview_status.config(text="pdftoppm required")
+            else:
+                self.preview_status.config(text="")
+
+    def clear_preview(self):
+        self.thumbnail_label.config(image="", text="No preview")
+        self.preview_name.config(text="")
+        self.preview_type.config(text="")
+        self.preview_status.config(text="")
+        self.current_thumbnail = None
 
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Media & PDF Playlist Manager")
-    root.geometry("450x560")
+    root.geometry("1000x650")
     app = MKVPlayerApp(root)
     root.mainloop()
